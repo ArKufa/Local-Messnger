@@ -1,13 +1,18 @@
+// server/index.js
 import express from 'express';
 import { createServer } from 'http';
 import { Server } from 'socket.io';
 import cors from 'cors';
-import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
+
+// Загружаем переменные окружения
+dotenv.config();
 
 const app = express();
 const server = createServer(app);
+const PORT = process.env.PORT || 3001;
 
-// Базовая настройка CORS
+// Настройка CORS
 const io = new Server(server, {
   cors: {
     origin: "*",
@@ -15,170 +20,184 @@ const io = new Server(server, {
   }
 });
 
-// Инициализация Supabase с проверкой ошибок
-let supabase;
-try {
-  const supabaseUrl = process.env.SUPABASE_URL;
-  const supabaseKey = process.env.SUPABASE_ANON_KEY;
-  
-  if (supabaseUrl && supabaseKey) {
-    supabase = createClient(supabaseUrl, supabaseKey);
-    console.log('✅ Supabase connected');
-  } else {
-    console.log('⚠️ Supabase credentials not found, running in local mode');
-  }
-} catch (error) {
-  console.log('⚠️ Supabase init failed, running in local mode:', error.message);
-}
-
 // Middleware
 app.use(cors());
 app.use(express.json());
+app.use(express.static('public'));
 
 // Health check endpoint
+app.get('/', (req, res) => {
+  res.json({
+    message: 'Local Messenger Server is running!',
+    timestamp: new Date().toISOString(),
+    version: '1.0.0'
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'OK', 
-    timestamp: new Date().toISOString(),
-    supabase: supabase ? 'connected' : 'local_mode'
-  });
-});
-
-// Socket.io аутентификация
-io.use((socket, next) => {
-  const user = socket.handshake.auth;
-  if (user && user.userId) {
-    socket.userId = user.userId;
-    socket.username = user.username;
-    next();
-  } else {
-    // Разрешаем анонимные подключения для тестирования
-    socket.userId = 'anonymous_' + Math.random().toString(36).substr(2, 9);
-    socket.username = 'Anonymous';
-    next();
-  }
-});
-
-// Обработчики Socket.io
-io.on('connection', (socket) => {
-  console.log('🔗 User connected:', socket.username);
-
-  // Приветственное сообщение
-  socket.emit('welcome', {
-    message: 'Connected to Local Messenger',
-    userId: socket.userId,
+    service: 'Local Messenger API',
     timestamp: new Date().toISOString()
   });
+});
 
-  // Создание комнаты
-  socket.on('create-room', (roomData) => {
+// Хранилище в памяти (если Supabase недоступен)
+const rooms = new Map();
+const messages = new Map();
+
+// Socket.io обработчики
+io.on('connection', (socket) => {
+  console.log('🔗 User connected:', socket.id);
+
+  // Приветственное сообщение
+  socket.emit('connected', {
+    message: 'Welcome to Local Messenger!',
+    userId: socket.id,
+    serverTime: new Date().toISOString()
+  });
+
+  // Создать комнату
+  socket.on('create-room', (data) => {
+    const roomId = `room_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
     const room = {
-      id: 'room_' + Math.random().toString(36).substr(2, 9),
-      name: roomData.name || 'New Room',
-      description: roomData.description || 'Room description',
-      created_by: socket.userId,
-      created_at: new Date().toISOString(),
-      is_private: false
+      id: roomId,
+      name: data.name || 'New Room',
+      description: data.description || '',
+      createdBy: socket.id,
+      createdAt: new Date().toISOString(),
+      users: [socket.id]
     };
 
-    // Сохраняем в Supabase если доступно
-    if (supabase) {
-      supabase
-        .from('rooms')
-        .insert({
-          name: room.name,
-          description: room.description,
-          created_by: room.created_by,
-          is_private: false
-        })
-        .then(({ error }) => {
-          if (error) console.error('Supabase room save error:', error);
-        });
-    }
+    rooms.set(roomId, room);
+    socket.join(roomId);
 
     socket.emit('room-created', room);
-    socket.join(room.id);
-    console.log(`✅ Room created: ${room.name}`);
+    console.log(`✅ Room created: ${room.name} (${roomId})`);
   });
 
-  // Отправка сообщения
-  socket.on('send-message', async (data) => {
-    try {
-      const message = {
-        id: 'msg_' + Math.random().toString(36).substr(2, 9),
-        room_id: data.roomId,
-        user_id: data.user?.id || socket.userId,
-        content: data.content,
-        created_at: new Date().toISOString(),
-        user: data.user || {
-          id: socket.userId,
-          username: socket.username,
-          display_name: socket.username
-        }
-      };
-
-      // Сохраняем в Supabase
-      if (supabase) {
-        const { error } = await supabase
-          .from('messages')
-          .insert({
-            room_id: data.roomId,
-            user_id: message.user_id,
-            content: data.content
-          });
-
-        if (error) {
-          console.error('Supabase message save error:', error);
-        }
+  // Присоединиться к комнате
+  socket.on('join-room', (roomId) => {
+    const room = rooms.get(roomId);
+    if (room) {
+      socket.join(roomId);
+      if (!room.users.includes(socket.id)) {
+        room.users.push(socket.id);
       }
-
-      // Отправляем в комнату
-      io.to(data.roomId).emit('new-message', message);
-      console.log(`💬 Message sent to room ${data.roomId}`);
       
-    } catch (error) {
-      console.error('❌ Message send error:', error);
-      socket.emit('error', { message: 'Failed to send message' });
+      // Отправить историю сообщений
+      const roomMessages = messages.get(roomId) || [];
+      socket.emit('room-joined', {
+        room,
+        messages: roomMessages,
+        users: room.users.length
+      });
+
+      // Уведомить других пользователей
+      socket.to(roomId).emit('user-joined', {
+        userId: socket.id,
+        roomId,
+        usersCount: room.users.length
+      });
+
+      console.log(`👤 User ${socket.id} joined room ${room.name}`);
+    } else {
+      socket.emit('error', { message: 'Room not found' });
     }
   });
 
-  // Получение сообщений комнаты
-  socket.on('get-messages', async (roomId) => {
-    try {
-      let messages = [];
-      
-      if (supabase) {
-        const { data, error } = await supabase
-          .from('messages')
-          .select(`
-            *,
-            profiles:user_id (
-              username,
-              display_name
-            )
-          `)
-          .eq('room_id', roomId)
-          .order('created_at', { ascending: true });
-
-        if (!error) messages = data || [];
-      }
-
-      socket.emit('room-messages', { roomId, messages });
-    } catch (error) {
-      console.error('❌ Get messages error:', error);
+  // Отправить сообщение
+  socket.on('send-message', (data) => {
+    const { roomId, content, user } = data;
+    
+    if (!roomId || !content) {
+      socket.emit('error', { message: 'Room ID and content are required' });
+      return;
     }
+
+    const message = {
+      id: `msg_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      roomId,
+      content,
+      user: user || {
+        id: socket.id,
+        username: `user_${socket.id.substr(0, 6)}`,
+        display_name: `User ${socket.id.substr(0, 6)}`
+      },
+      timestamp: new Date().toISOString()
+    };
+
+    // Сохраняем сообщение
+    if (!messages.has(roomId)) {
+      messages.set(roomId, []);
+    }
+    messages.get(roomId).push(message);
+
+    // Отправляем всем в комнате
+    io.to(roomId).emit('new-message', message);
+    console.log(`💬 Message sent to room ${roomId}`);
+  });
+
+  // Получить список комнат
+  socket.on('get-rooms', () => {
+    const roomList = Array.from(rooms.values()).map(room => ({
+      ...room,
+      usersCount: room.users.length,
+      messageCount: (messages.get(room.id) || []).length
+    }));
+    
+    socket.emit('rooms-list', roomList);
   });
 
   // Отключение
   socket.on('disconnect', () => {
-    console.log('🔌 User disconnected:', socket.username);
+    console.log('🔌 User disconnected:', socket.id);
+    
+    // Удаляем пользователя из всех комнат
+    rooms.forEach((room, roomId) => {
+      if (room.users.includes(socket.id)) {
+        room.users = room.users.filter(userId => userId !== socket.id);
+        
+        // Уведомляем остальных
+        socket.to(roomId).emit('user-left', {
+          userId: socket.id,
+          roomId,
+          usersCount: room.users.length
+        });
+
+        // Если комната пустая, удаляем её через некоторое время
+        if (room.users.length === 0) {
+          setTimeout(() => {
+            if (rooms.get(roomId)?.users.length === 0) {
+              rooms.delete(roomId);
+              messages.delete(roomId);
+              console.log(`🗑️ Room deleted: ${room.name}`);
+            }
+          }, 300000); // 5 минут
+        }
+      }
+    });
   });
 });
 
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
-  console.log(`🚀 LM Server running on port ${PORT}`);
-  console.log(`🌐 Health check: http://localhost:${PORT}/health`);
+// Запуск сервера
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`
+🚀 Local Messenger Server started!
+📍 Port: ${PORT}
+📡 WebSocket: ws://0.0.0.0:${PORT}
+🌐 Health: http://0.0.0.0:${PORT}/health
+⏰ Time: ${new Date().toISOString()}
+  `);
+});
+
+// Обработка graceful shutdown
+process.on('SIGTERM', () => {
+  console.log('🛑 Received SIGTERM, shutting down gracefully');
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
 });
 
 export default app;
