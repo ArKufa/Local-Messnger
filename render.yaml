@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: lm-server
+    env: node
+    plan: free
+    buildCommand: cd server && npm install
+    startCommand: cd server && node index.js
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPABASE_URL
+        fromDatabase:
+          name: supabase
+          property: url
+      - key: SUPABASE_ANON_KEY
+        fromDatabase:
+          name: supabase
+          property: anon_key
