@@ -4,15 +4,9 @@ services:
     env: node
     plan: free
     buildCommand: cd server && npm install
-    startCommand: cd server && node index.js
+    startCommand: cd server && npm start
     envVars:
       - key: NODE_ENV
         value: production
-      - key: SUPABASE_URL
-        fromDatabase:
-          name: supabase
-          property: url
-      - key: SUPABASE_ANON_KEY
-        fromDatabase:
-          name: supabase
-          property: anon_key
+      - key: PORT
+        value: 3001
